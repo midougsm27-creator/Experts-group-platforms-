@@ -1,0 +1,972 @@
+--- a/app/api/cash/route.ts
++++ b/app/api/cash/route.ts
+@@ -1,6 +1,7 @@
+-import { and, desc, eq } from "drizzle-orm";
++import { desc, eq } from "drizzle-orm";
+ import { getDb } from "../../../db";
+ import { cashboxes, cashMovements } from "../../../db/schema";
++import { authorizeApiRequest, authorizeShopAccess } from "../../../lib/authz";
+ 
+ const shops = ["ProPhone", "MidouGSM"];
+ 
+@@ -11,8 +12,12 @@
+ 
+ export async function GET(request: Request) {
+   try {
++    const access = await authorizeApiRequest(request, "cash.view");
++    if (access instanceof Response) return access;
+     const db = getDb();
+     const shop = new URL(request.url).searchParams.get("shop")?.trim() ?? "all";
++    const denied = authorizeShopAccess(access, shop);
++    if (denied) return denied;
+     const boxes = await db.select().from(cashboxes).where(shop !== "all" ? eq(cashboxes.shop, shop) : undefined).orderBy(cashboxes.shop, cashboxes.name);
+     const movements = await db.select().from(cashMovements).where(shop !== "all" ? eq(cashMovements.shop, shop) : undefined).orderBy(desc(cashMovements.id)).limit(100);
+     const balances = new Map<number, number>();
+@@ -32,6 +37,8 @@
+ 
+ export async function POST(request: Request) {
+   try {
++    const access = await authorizeApiRequest(request, "cash.manage");
++    if (access instanceof Response) return access;
+     const body = (await request.json()) as Record<string, unknown>;
+     const action = String(body.action ?? "");
+     const db = getDb();
+@@ -44,6 +51,8 @@
+       if (!shops.includes(shop) || !name || !Number.isFinite(openingBalance) || openingBalance < 0) {
+         return Response.json({ error: "Informations de caisse invalides." }, { status: 400 });
+       }
++      const denied = authorizeShopAccess(access, shop);
++      if (denied) return denied;
+       const created = await db.insert(cashboxes).values({ shop, name, type, openingBalance }).returning();
+       return Response.json({ cashbox: created[0] }, { status: 201 });
+     }
+@@ -55,6 +64,8 @@
+       if (!Number.isInteger(id) || id < 1 || !name || !type) return Response.json({ error: "Informations de caisse invalides." }, { status: 400 });
+       const existing = (await db.select().from(cashboxes).where(eq(cashboxes.id, id)).limit(1))[0];
+       if (!existing) return Response.json({ error: "Caisse introuvable." }, { status: 404 });
++      const denied = authorizeShopAccess(access, existing.shop);
++      if (denied) return denied;
+       const updated = (await db.update(cashboxes).set({ name, type }).where(eq(cashboxes.id, id)).returning())[0];
+       return Response.json({ cashbox: updated });
+     }
+@@ -69,6 +80,8 @@
+       if (!box || !["in", "out"].includes(direction) || !Number.isFinite(amount) || amount <= 0 || !reason) {
+         return Response.json({ error: "Mouvement de caisse invalide." }, { status: 400 });
+       }
++      const denied = authorizeShopAccess(access, box.shop);
++      if (denied) return denied;
+       const created = await db.insert(cashMovements).values({ cashboxId, shop: box.shop, direction, movementType: direction === "in" ? "Encaissement" : "Décaissement", amount, reason, reference }).returning();
+       return Response.json({ movement: created[0] }, { status: 201 });
+     }
+@@ -85,6 +98,10 @@
+       const source = boxes.find((box) => box.id === sourceId);
+       const destination = boxes.find((box) => box.id === destinationId);
+       if (!source || !destination) return Response.json({ error: "Caisse introuvable." }, { status: 404 });
++      const sourceDenied = authorizeShopAccess(access, source.shop);
++      if (sourceDenied) return sourceDenied;
++      const destinationDenied = authorizeShopAccess(access, destination.shop);
++      if (destinationDenied) return destinationDenied;
+       if (!source.active || !destination.active) return Response.json({ error: "Choisissez deux caisses actives." }, { status: 400 });
+       if (source.shop !== destination.shop) return Response.json({ error: "Le transfert entre ProPhone et MidouGSM est interdit. Choisissez deux caisses du même magasin." }, { status: 400 });
+       const sourceMovements = await db.select().from(cashMovements).where(eq(cashMovements.cashboxId, sourceId));
+
+--- a/app/api/catalog/route.ts
++++ b/app/api/catalog/route.ts
+@@ -1,6 +1,7 @@
+ import { asc, and, eq } from "drizzle-orm";
+ import { getDb } from "../../../db";
+ import { catalogEntries } from "../../../db/schema";
++import { authorizeApiRequest } from "../../../lib/authz";
+ 
+ const categories = ["deviceType", "brand", "model", "partQuality", "issue", "part", "storageLocation"] as const;
+ type Category = (typeof categories)[number];
+@@ -29,8 +30,10 @@
+   return String(value ?? "").trim().replace(/\s+/g, " ");
+ }
+ 
+-export async function GET() {
++export async function GET(request: Request) {
+   try {
++    const access = await authorizeApiRequest(request, ["repairs.view", "stock.view"]);
++    if (access instanceof Response) return access;
+     const custom = await getDb().select().from(catalogEntries).orderBy(asc(catalogEntries.name));
+     const catalog = Object.fromEntries(categories.map((category) => {
+       const merged = [...baseCatalog[category], ...custom.filter((entry) => entry.category === category)];
+@@ -45,6 +48,8 @@
+ 
+ export async function POST(request: Request) {
+   try {
++    const access = await authorizeApiRequest(request, ["repairs.edit", "stock.edit"]);
++    if (access instanceof Response) return access;
+     const body = (await request.json()) as Record<string, unknown>;
+     const category = normalize(body.category) as Category;
+     const name = normalize(body.name);
+
+--- a/app/api/customers/[id]/payments/route.ts
++++ b/app/api/customers/[id]/payments/route.ts
+@@ -1,14 +1,20 @@
+ import { eq } from "drizzle-orm";
+ import { getDb } from "../../../../../db";
+ import { cashboxes, cashMovements, customerPayments, customers } from "../../../../../db/schema";
++import { authorizeApiRequest, authorizeShopAccess } from "../../../../../lib/authz";
+ 
+ export async function POST(request: Request, context: { params: Promise<{ id: string }> }) {
+   try {
++    const access = await authorizeApiRequest(request, "customers.manage");
++    if (access instanceof Response) return access;
+     const id = Number((await context.params).id); const body = await request.json() as Record<string, unknown>;
+     const amount = Math.round(Number(body.amount ?? 0)); const cashboxId = body.cashboxId ? Number(body.cashboxId) : null;
+     if (!Number.isInteger(id) || !Number.isFinite(amount) || amount <= 0) return Response.json({ error: "Montant invalide." }, { status: 400 });
+     const db = getDb(); const customer = (await db.select().from(customers).where(eq(customers.id, id)).limit(1))[0];
+     if (!customer) return Response.json({ error: "Client introuvable." }, { status: 404 });
++    const denied = authorizeShopAccess(access, customer.shop);
++    if (denied) return denied;
++    if (cashboxId && !access.permissions.includes("cash.manage")) return Response.json({ error: "Vous n’avez pas l’autorisation d’enregistrer un mouvement de caisse." }, { status: 403 });
+     let cashbox = null;
+     if (cashboxId) { cashbox = (await db.select().from(cashboxes).where(eq(cashboxes.id, cashboxId)).limit(1))[0]; if (!cashbox || cashbox.shop !== customer.shop) return Response.json({ error: "Caisse invalide pour ce magasin." }, { status: 400 }); }
+     const created = (await db.insert(customerPayments).values({ customerId: id, shop: customer.shop, amount, cashboxId, method: String(body.method ?? "Espèces"), notes: String(body.notes ?? "").trim() }).returning())[0];
+
+--- a/app/api/customers/[id]/route.ts
++++ b/app/api/customers/[id]/route.ts
+@@ -1,6 +1,7 @@
+ import { and, eq, ne } from "drizzle-orm";
+ import { getDb } from "../../../../db";
+ import { customerPayments, customers, repairs } from "../../../../db/schema";
++import { authorizeApiRequest, authorizeShopAccess } from "../../../../lib/authz";
+ 
+ const shops = ["ProPhone", "MidouGSM"];
+ const customerTypes = ["Détail", "Gros", "Réparateur"];
+@@ -8,12 +9,20 @@
+ 
+ export async function PATCH(request: Request, context: { params: Promise<{ id: string }> }) {
+   try {
++    const access = await authorizeApiRequest(request, "customers.manage");
++    if (access instanceof Response) return access;
+     const id = Number((await context.params).id);
+     const body = await request.json() as Record<string, unknown>;
+     const name = String(body.name ?? "").trim(); const phone = String(body.phone ?? "").trim(); const shop = String(body.shop ?? "");
+     const customerType = String(body.customerType ?? "Détail"); const source = String(body.source ?? "Magasin");
+     if (!Number.isInteger(id) || !name || !phone || !shops.includes(shop) || !customerTypes.includes(customerType) || !sources.includes(source)) return Response.json({ error: "Informations client invalides." }, { status: 400 });
+     const db = getDb();
++    const current = (await db.select().from(customers).where(eq(customers.id, id)).limit(1))[0];
++    if (!current) return Response.json({ error: "Client introuvable." }, { status: 404 });
++    const currentDenied = authorizeShopAccess(access, current.shop);
++    if (currentDenied) return currentDenied;
++    const targetDenied = authorizeShopAccess(access, shop);
++    if (targetDenied) return targetDenied;
+     const duplicate = await db.select({ id: customers.id }).from(customers).where(and(eq(customers.shop, shop), eq(customers.phone, phone), ne(customers.id, id))).limit(1);
+     if (duplicate.length) return Response.json({ error: "Ce numéro existe déjà dans ce magasin." }, { status: 409 });
+     const updated = (await db.update(customers).set({ name, phone, shop, customerType, source, email: String(body.email ?? "").trim(), address: String(body.address ?? "").trim(), notes: String(body.notes ?? "").trim(), updatedAt: new Date().toISOString() }).where(eq(customers.id, id)).returning())[0];
+@@ -22,9 +31,15 @@
+   } catch (error) { return Response.json({ error: error instanceof Error ? error.message : "Modification impossible." }, { status: 500 }); }
+ }
+ 
+-export async function DELETE(_: Request, context: { params: Promise<{ id: string }> }) {
++export async function DELETE(request: Request, context: { params: Promise<{ id: string }> }) {
+   try {
++    const access = await authorizeApiRequest(request, "customers.manage");
++    if (access instanceof Response) return access;
+     const id = Number((await context.params).id); const db = getDb();
++    const customer = (await db.select().from(customers).where(eq(customers.id, id)).limit(1))[0];
++    if (!customer) return Response.json({ error: "Client introuvable." }, { status: 404 });
++    const denied = authorizeShopAccess(access, customer.shop);
++    if (denied) return denied;
+     const linked = await db.select({ id: repairs.id }).from(repairs).where(eq(repairs.customerId, id)).limit(1);
+     if (linked.length) return Response.json({ error: "Ce client possède des réparations. Désactivez-le au lieu de le supprimer." }, { status: 409 });
+     await db.delete(customerPayments).where(eq(customerPayments.customerId, id));
+
+--- a/app/api/customers/route.ts
++++ b/app/api/customers/route.ts
+@@ -1,6 +1,7 @@
+ import { and, asc, eq, like, or, sql } from "drizzle-orm";
+ import { getDb } from "../../../db";
+ import { customerPayments, customers, repairs, sales } from "../../../db/schema";
++import { authorizeApiRequest, authorizeShopAccess } from "../../../lib/authz";
+ 
+ const shops = ["ProPhone", "MidouGSM"];
+ const customerTypes = ["Détail", "Gros", "Réparateur"];
+@@ -8,8 +9,12 @@
+ 
+ export async function GET(request: Request) {
+   try {
++    const access = await authorizeApiRequest(request, "customers.manage");
++    if (access instanceof Response) return access;
+     const params = new URL(request.url).searchParams;
+-    const shop = params.get("shop") ?? "all";
++    const shop = params.get("shop") || "all";
++    const denied = authorizeShopAccess(access, shop);
++    if (denied) return denied;
+     const query = params.get("q")?.trim() ?? "";
+     const type = params.get("type") ?? "all";
+     const source = params.get("source") ?? "all";
+@@ -47,12 +52,16 @@
+ 
+ export async function POST(request: Request) {
+   try {
++    const access = await authorizeApiRequest(request, "customers.manage");
++    if (access instanceof Response) return access;
+     const body = await request.json() as Record<string, unknown>;
+     const name = String(body.name ?? "").trim();
+     const phone = String(body.phone ?? "").trim();
+     const shop = String(body.shop ?? "");
+     const customerType = String(body.customerType ?? "Détail");
+     const source = String(body.source ?? "Magasin");
++    const denied = authorizeShopAccess(access, shop);
++    if (denied) return denied;
+     if (!name || !phone || !shops.includes(shop) || !customerTypes.includes(customerType) || !sources.includes(source)) return Response.json({ error: "Informations client invalides." }, { status: 400 });
+     const db = getDb();
+     const existing = await db.select({ id: customers.id }).from(customers).where(and(eq(customers.shop, shop), eq(customers.phone, phone))).limit(1);
+
+--- a/app/api/order-requests/route.ts
++++ b/app/api/order-requests/route.ts
+@@ -1,6 +1,7 @@
+ import { and, asc, eq, inArray, sql } from "drizzle-orm";
+ import { getDb } from "../../../db";
+ import { products, repairParts, repairs, stockRequests } from "../../../db/schema";
++import { authorizeApiRequest, authorizeShopAccess } from "../../../lib/authz";
+ 
+ const validShops = ["ProPhone", "MidouGSM"];
+ const supplierStatuses = ["En attente", "Disponible", "Partiellement disponible", "Indisponible", "Alternative proposée"];
+@@ -8,7 +9,11 @@
+ 
+ export async function GET(request: Request) {
+   try {
+-    const shop = new URL(request.url).searchParams.get("shop")?.trim() ?? "all";
++    const access = await authorizeApiRequest(request, "orders.view");
++    if (access instanceof Response) return access;
++    const shop = new URL(request.url).searchParams.get("shop")?.trim() || "all";
++    const denied = authorizeShopAccess(access, shop);
++    if (denied) return denied;
+     const db = getDb();
+     const repairRows = await db.select({
+       id: repairParts.id, productId: repairParts.productId, shop: repairParts.shop, itemName: repairParts.itemName,
+@@ -42,8 +47,12 @@
+ 
+ export async function POST(request: Request) {
+   try {
++    const access = await authorizeApiRequest(request, "orders.manage");
++    if (access instanceof Response) return access;
+     const body = await request.json() as Record<string, unknown>;
+     const shop = String(body.shop ?? "");
++    const denied = authorizeShopAccess(access, shop);
++    if (denied) return denied;
+     const rawLines = Array.isArray(body.lines) ? body.lines : [{ productId: body.productId, quantity: body.quantity, notes: body.notes }];
+     const lines = rawLines.map((line) => {
+       const value = line as Record<string, unknown>;
+@@ -63,15 +72,23 @@
+ 
+ export async function PATCH(request: Request) {
+   try {
++    const access = await authorizeApiRequest(request, "orders.manage");
++    if (access instanceof Response) return access;
+     const body = await request.json() as Record<string, unknown>; const sourceType = String(body.sourceType ?? "");
+     const ids = Array.isArray(body.ids) ? body.ids.map(Number).filter(Number.isInteger) : [];
+     if (!ids.length || !["Réparation", "Stock"].includes(sourceType)) return Response.json({ error: "Demande invalide." }, { status: 400 });
++    const db = getDb();
++    const affected = sourceType === "Réparation"
++      ? await db.select({ shop: repairParts.shop }).from(repairParts).where(inArray(repairParts.id, ids))
++      : await db.select({ shop: stockRequests.shop }).from(stockRequests).where(inArray(stockRequests.id, ids));
++    if (affected.length !== ids.length) return Response.json({ error: "Une demande est introuvable." }, { status: 404 });
++    for (const item of affected) { const denied = authorizeShopAccess(access, item.shop); if (denied) return denied; }
+     const changes: { supplierStatus?: string; orderStatus?: string; updatedAt: ReturnType<typeof sql> } = { updatedAt: sql`CURRENT_TIMESTAMP` };
+     if (body.supplierStatus !== undefined) { const value = String(body.supplierStatus); if (!supplierStatuses.includes(value)) return Response.json({ error: "État fournisseur invalide." }, { status: 400 }); changes.supplierStatus = value; }
+     if (body.orderStatus !== undefined) { const value = String(body.orderStatus); if (!orderStatuses.includes(value)) return Response.json({ error: "État commande invalide." }, { status: 400 }); changes.orderStatus = value; }
+     if (!changes.supplierStatus && !changes.orderStatus) return Response.json({ error: "Aucune modification reçue." }, { status: 400 });
+-    if (sourceType === "Réparation") await getDb().update(repairParts).set(changes).where(inArray(repairParts.id, ids));
+-    else await getDb().update(stockRequests).set(changes).where(inArray(stockRequests.id, ids));
++    if (sourceType === "Réparation") await db.update(repairParts).set(changes).where(inArray(repairParts.id, ids));
++    else await db.update(stockRequests).set(changes).where(inArray(stockRequests.id, ids));
+     return Response.json({ updated: ids.length });
+   } catch (error) {
+     return Response.json({ error: error instanceof Error ? error.message : "Modification impossible." }, { status: 500 });
+
+--- a/app/api/product-taxonomy/route.ts
++++ b/app/api/product-taxonomy/route.ts
+@@ -1,6 +1,7 @@
+ import { and, asc, eq } from "drizzle-orm";
+ import { getDb } from "../../../db";
+ import { productTaxonomy } from "../../../db/schema";
++import { authorizeApiRequest } from "../../../lib/authz";
+ 
+ const categories = ["family", "subfamily", "brand", "model", "quality", "manufacturer", "color"] as const;
+ type Category = (typeof categories)[number];
+@@ -73,8 +74,10 @@
+   return clean(value).toUpperCase();
+ }
+ 
+-export async function GET() {
++export async function GET(request: Request) {
+   try {
++    const access = await authorizeApiRequest(request, "stock.view");
++    if (access instanceof Response) return access;
+     const custom = await getDb().select().from(productTaxonomy).orderBy(asc(productTaxonomy.name));
+     const taxonomy = Object.fromEntries(categories.map((category) => {
+       const merged = [...defaults[category], ...custom.filter((item) => item.category === category)];
+@@ -90,6 +93,8 @@
+ 
+ export async function POST(request: Request) {
+   try {
++    const access = await authorizeApiRequest(request, "stock.edit");
++    if (access instanceof Response) return access;
+     const body = await request.json() as Record<string, unknown>;
+     const category = clean(body.category) as Category;
+     const name = clean(body.name);
+
+--- a/app/api/products/import/route.ts
++++ b/app/api/products/import/route.ts
+@@ -1,6 +1,7 @@
+ import { and, eq } from "drizzle-orm";
+ import { getDb } from "../../../../db";
+ import { catalogEntries, products } from "../../../../db/schema";
++import { authorizeApiRequest } from "../../../../lib/authz";
+ 
+ type ImportRow = {
+   name?: unknown; family?: unknown; subfamily?: unknown; brand?: unknown; model?: unknown;
+@@ -17,6 +18,8 @@
+ 
+ export async function POST(request: Request) {
+   try {
++    const access = await authorizeApiRequest(request, "stock.edit");
++    if (access instanceof Response) return access;
+     const body = await request.json() as { rows?: ImportRow[] };
+     const rows = Array.isArray(body.rows) ? body.rows.slice(0, 500) : [];
+     if (!rows.length) return Response.json({ error: "Le fichier ne contient aucun produit." }, { status: 400 });
+
+--- a/app/api/products/route.ts
++++ b/app/api/products/route.ts
+@@ -1,6 +1,7 @@
+ import { desc, eq, inArray, like, or } from "drizzle-orm";
+ import { getDb } from "../../../db";
+ import { catalogEntries, products, stockMovements } from "../../../db/schema";
++import { authorizeApiRequest } from "../../../lib/authz";
+ 
+ function normalizedCode(value: string, fallback: string) {
+   const code = value.normalize("NFD").replace(/[\u0300-\u036f]/g, "").replace(/[^a-zA-Z0-9]/g, "").toUpperCase().slice(0, 3);
+@@ -9,22 +10,29 @@
+ 
+ export async function GET(request: Request) {
+   try {
++    const access = await authorizeApiRequest(request, "stock.view");
++    if (access instanceof Response) return access;
+     const db = getDb();
+     const parameters = new URL(request.url).searchParams;
+     const query = parameters.get("q")?.trim() ?? "";
+     const where = query ? or(like(products.name, `%${query}%`), like(products.sku, `%${query}%`), like(products.barcode, `%${query}%`), like(products.sourceReference, `%${query}%`), like(products.brand, `%${query}%`), like(products.model, `%${query}%`), like(products.manufacturer, `%${query}%`)) : undefined;
+     const rows = await db.select().from(products).where(where).orderBy(desc(products.id)).limit(150);
+     const movements = rows.length ? await db.select().from(stockMovements).where(inArray(stockMovements.productId, rows.map((item) => item.id))) : [];
+-    return Response.json({ products: rows.map((product) => ({
+-      ...product,
+-      suggestedSalePrice: movements
+-        .filter((movement) => movement.productId === product.id && movement.salePrice > 0)
+-        .sort((a, b) => b.id - a.id)[0]?.salePrice ?? product.pv1,
+-      stock: {
+-        ProPhone: movements.filter((movement) => movement.productId === product.id && movement.shop === "ProPhone").reduce((sum, movement) => sum + movement.quantity, 0),
+-        MidouGSM: movements.filter((movement) => movement.productId === product.id && movement.shop === "MidouGSM").reduce((sum, movement) => sum + movement.quantity, 0),
+-      },
+-    })) }, { headers: { "Cache-Control": "no-store" } });
++    return Response.json({ products: rows.map((product) => {
++      const { purchasePrice, ...publicProduct } = product;
++      return {
++        ...publicProduct,
++        ...(access.permissions.includes("stock.purchase_price") ? { purchasePrice } : {}),
++        suggestedSalePrice: movements
++          .filter((movement) => movement.productId === product.id && movement.salePrice > 0)
++          .sort((a, b) => b.id - a.id)[0]?.salePrice ?? product.pv1,
++        stock: Object.fromEntries(["ProPhone", "MidouGSM"].map((shop) => [shop,
++          access.shops.includes(shop)
++            ? movements.filter((movement) => movement.productId === product.id && movement.shop === shop).reduce((sum, movement) => sum + movement.quantity, 0)
++            : null,
++        ])),
++      };
++    }) }, { headers: { "Cache-Control": "no-store" } });
+   } catch (error) {
+     const message = error instanceof Error ? error.message : "Erreur inattendue";
+     return Response.json({ error: message.includes("no such table") ? "Le catalogue produits n’est pas encore initialisé." : message }, { status: 500 });
+@@ -33,6 +41,8 @@
+ 
+ export async function POST(request: Request) {
+   try {
++    const access = await authorizeApiRequest(request, "stock.edit");
++    if (access instanceof Response) return access;
+     const body = (await request.json()) as Record<string, unknown>;
+     const name = String(body.name ?? "").trim();
+     const family = String(body.family ?? "").trim();
+@@ -48,12 +58,13 @@
+       model: String(body.model ?? "").trim(), compatibility: "",
+       quality: String(body.quality ?? "").trim(), manufacturer: String(body.manufacturer ?? "").trim(), color: String(body.color ?? "").trim(),
+       sourceReference: String(body.sourceReference ?? "").trim(),
+-      purchasePrice: cleanPrice(body.purchasePrice), pv1: cleanPrice(body.pv1), pv2: cleanPrice(body.pv2), pv3: cleanPrice(body.pv3),
++      purchasePrice: access.permissions.includes("stock.purchase_price") ? cleanPrice(body.purchasePrice) : 0, pv1: cleanPrice(body.pv1), pv2: cleanPrice(body.pv2), pv3: cleanPrice(body.pv3),
+       capacity: "", unit: "Pièce",
+       warranty: String(body.warranty ?? "").trim(), notes: String(body.notes ?? "").trim(),
+     }).returning();
+     await db.insert(catalogEntries).values({ category: "part", name }).onConflictDoNothing();
+-    return Response.json({ product: created[0] }, { status: 201 });
++    const responseProduct = access.permissions.includes("stock.purchase_price") ? created[0] : withoutPurchasePrice(created[0]);
++    return Response.json({ product: responseProduct }, { status: 201 });
+   } catch (error) {
+     const message = error instanceof Error ? error.message : "Erreur inattendue";
+     return Response.json({ error: message.includes("UNIQUE") ? "Ce code produit existe déjà." : message }, { status: message.includes("UNIQUE") ? 409 : 500 });
+@@ -65,8 +76,14 @@
+   return Number.isFinite(price) ? Math.max(0, Math.round(price)) : 0;
+ }
+ 
++function withoutPurchasePrice<T extends { purchasePrice: number }>(product: T) {
++  return Object.fromEntries(Object.entries(product).filter(([key]) => key !== "purchasePrice"));
++}
++
+ export async function PATCH(request: Request) {
+   try {
++    const access = await authorizeApiRequest(request, "stock.edit");
++    if (access instanceof Response) return access;
+     const body = (await request.json()) as Record<string, unknown>;
+     const id = Number(body.id);
+     const name = String(body.name ?? "").trim();
+@@ -74,17 +91,20 @@
+     if (!Number.isInteger(id) || id < 1) return Response.json({ error: "Produit invalide." }, { status: 400 });
+     if (!name || !family) return Response.json({ error: "Le nom et la famille sont obligatoires." }, { status: 400 });
+     const db = getDb();
++    const existing = (await db.select().from(products).where(eq(products.id, id)).limit(1))[0];
++    if (!existing) return Response.json({ error: "Produit introuvable." }, { status: 404 });
+     const updated = await db.update(products).set({
+       name, family, subfamily: String(body.subfamily ?? "").trim(), brand: String(body.brand ?? "").trim(),
+       model: String(body.model ?? "").trim(), quality: String(body.quality ?? "").trim(),
+       manufacturer: String(body.manufacturer ?? "").trim(), color: String(body.color ?? "").trim(),
+-      sourceReference: String(body.sourceReference ?? "").trim(), purchasePrice: cleanPrice(body.purchasePrice),
++      sourceReference: String(body.sourceReference ?? "").trim(), purchasePrice: access.permissions.includes("stock.purchase_price") ? cleanPrice(body.purchasePrice) : existing.purchasePrice,
+       pv1: cleanPrice(body.pv1), pv2: cleanPrice(body.pv2), pv3: cleanPrice(body.pv3),
+       warranty: String(body.warranty ?? "").trim(), notes: String(body.notes ?? "").trim(),
+     }).where(eq(products.id, id)).returning();
+     if (!updated.length) return Response.json({ error: "Produit introuvable." }, { status: 404 });
+     await db.insert(catalogEntries).values({ category: "part", name }).onConflictDoNothing();
+-    return Response.json({ product: updated[0] });
++    const responseProduct = access.permissions.includes("stock.purchase_price") ? updated[0] : withoutPurchasePrice(updated[0]);
++    return Response.json({ product: responseProduct });
+   } catch (error) {
+     const message = error instanceof Error ? error.message : "Erreur inattendue";
+     return Response.json({ error: message.includes("UNIQUE") ? "Cette référence existe déjà." : message }, { status: message.includes("UNIQUE") ? 409 : 500 });
+
+--- a/app/api/purchases/route.ts
++++ b/app/api/purchases/route.ts
+@@ -3,6 +3,7 @@
+ import { getDb } from "../../../db";
+ import { cashboxes, cashMovements, products, purchaseLines, purchases, stockMovements, suppliers } from "../../../db/schema";
+ import { allocateReceivedQuantity } from "../../../lib/order-requests";
++import { authorizeApiRequest, authorizeShopAccess } from "../../../lib/authz";
+ 
+ type PurchaseLineInput = { productId: number; quantity: number; purchasePrice: number; salePrice: number };
+ const validShops = ["ProPhone", "MidouGSM"];
+@@ -50,14 +51,20 @@
+ 
+ export async function GET(request: Request) {
+   try {
++    const access = await authorizeApiRequest(request, "purchases.view");
++    if (access instanceof Response) return access;
+     const parameters = new URL(request.url).searchParams; const id = Number(parameters.get("id") ?? 0); const db = getDb();
+     if (id) {
+       const purchase = (await db.select().from(purchases).where(eq(purchases.id, id)).limit(1))[0]; if (!purchase) return Response.json({ error: "Bon introuvable." }, { status: 404 });
++      const denied = authorizeShopAccess(access, purchase.shop);
++      if (denied) return denied;
+       const lines = await db.select().from(purchaseLines).where(eq(purchaseLines.purchaseId, id));
+       const supplier = purchase.supplierId ? (await db.select().from(suppliers).where(eq(suppliers.id, purchase.supplierId)).limit(1))[0] : null;
+       return Response.json({ purchase, lines, supplier });
+     }
+     const shop = parameters.get("shop") ?? "all"; const query = parameters.get("q")?.trim() ?? "";
++    const denied = authorizeShopAccess(access, shop);
++    if (denied) return denied;
+     const clauses = [shop !== "all" ? eq(purchases.shop, shop) : undefined, query ? or(like(purchases.receiptNumber, `%${query}%`), like(purchases.supplier, `%${query}%`), like(purchases.supplierInvoice, `%${query}%`)) : undefined].filter(Boolean);
+     const where = clauses.length === 2 ? and(clauses[0], clauses[1]) : clauses[0]; const rows = await db.select().from(purchases).where(where).orderBy(desc(purchases.id)).limit(150);
+     return Response.json({ purchases: rows });
+@@ -66,7 +73,11 @@
+ 
+ export async function POST(request: Request) {
+   try {
+-    const input = parseForm(await request.formData()); const valid = await validateInput(input); const receiptNumber = `REC-${input.shop === "ProPhone" ? "PRO" : "MID"}-${new Date().getFullYear()}-${String(Date.now()).slice(-7)}`;
++    const access = await authorizeApiRequest(request, "purchases.manage");
++    if (access instanceof Response) return access;
++    const input = parseForm(await request.formData()); const denied = authorizeShopAccess(access, input.shop); if (denied) return denied; const valid = await validateInput(input);
++    if (valid.paidAmount > 0 && !access.permissions.includes("cash.manage")) return Response.json({ error: "Vous n’avez pas l’autorisation d’enregistrer un mouvement de caisse." }, { status: 403 });
++    const receiptNumber = `REC-${input.shop === "ProPhone" ? "PRO" : "MID"}-${new Date().getFullYear()}-${String(Date.now()).slice(-7)}`;
+     const stored = await storeDocument(input.document, input.shop, receiptNumber); const confirmed = input.status !== "Brouillon";
+     const created = (await valid.db.insert(purchases).values({ receiptNumber, supplierId: input.supplierId, supplier: valid.selectedSupplier.name, supplierInvoice: input.supplierInvoice, shop: input.shop, settlementType: confirmed ? input.settlementType : "À terme", cashboxId: confirmed && valid.paidAmount > 0 ? input.cashboxId : null, grossAmount: valid.grossAmount, discountAmount: valid.discountAmount, netAmount: valid.netAmount, paidAmount: confirmed ? valid.paidAmount : 0, notes: input.notes, status: confirmed ? "Confirmé" : "Brouillon", documentKey: stored.key, documentName: stored.name }).returning())[0];
+     const statements: any[] = input.lines.flatMap((line) => { const product = valid.productRows.find((item) => item.id === line.productId)!; const rows = [valid.db.insert(purchaseLines).values({ purchaseId: created.id, productId: line.productId, productName: product.name, sku: product.sku, quantity: line.quantity, purchasePrice: Math.round(line.purchasePrice), salePrice: Math.round(line.salePrice || 0), lineTotal: Math.round(line.quantity * line.purchasePrice) })]; if (confirmed) rows.push(valid.db.insert(stockMovements).values({ productId: line.productId, shop: input.shop, location: "Magasin", movementType: "Réception", quantity: line.quantity, purchasePrice: Math.round(line.purchasePrice), unitCost: Math.round(line.purchasePrice), salePrice: Math.round(line.salePrice || 0), reference: receiptNumber }) as never); return rows; });
+@@ -79,8 +90,12 @@
+ 
+ export async function PATCH(request: Request) {
+   try {
++    const access = await authorizeApiRequest(request, "purchases.manage");
++    if (access instanceof Response) return access;
+     const form = await request.formData(); const id = Number(form.get("id") ?? 0); if (!Number.isInteger(id) || id < 1) return Response.json({ error: "Bon invalide." }, { status: 400 });
+-    const input = parseForm(form); const valid = await validateInput(input); const existing = (await valid.db.select().from(purchases).where(eq(purchases.id, id)).limit(1))[0]; if (!existing) return Response.json({ error: "Bon introuvable." }, { status: 404 });
++    const input = parseForm(form); const denied = authorizeShopAccess(access, input.shop); if (denied) return denied; const valid = await validateInput(input); const existing = (await valid.db.select().from(purchases).where(eq(purchases.id, id)).limit(1))[0]; if (!existing) return Response.json({ error: "Bon introuvable." }, { status: 404 });
++    const existingDenied = authorizeShopAccess(access, existing.shop); if (existingDenied) return existingDenied;
++    if (valid.paidAmount > 0 && !access.permissions.includes("cash.manage")) return Response.json({ error: "Vous n’avez pas l’autorisation d’enregistrer un mouvement de caisse." }, { status: 403 });
+     if (existing.shop !== input.shop) return Response.json({ error: "Le magasin du bon ne peut pas être modifié." }, { status: 400 });
+     const oldLines = await valid.db.select().from(purchaseLines).where(eq(purchaseLines.purchaseId, id)); const confirmed = input.status !== "Brouillon";
+     const stored = await storeDocument(input.document, input.shop, existing.receiptNumber, { key: existing.documentKey, name: existing.documentName });
+
+--- a/app/api/repair-parts/route.ts
++++ b/app/api/repair-parts/route.ts
+@@ -2,17 +2,26 @@
+ import { getDb } from "../../../db";
+ import { products, repairParts, repairs, stockMovements } from "../../../db/schema";
+ import { addPartToRepair, markPartUnused, partStatuses, stockForProduct } from "../../../lib/repair-parts";
++import { authorizeApiRequest, authorizeShopAccess } from "../../../lib/authz";
+ 
+ export async function GET(request: Request) {
+   try {
+     const parameters = new URL(request.url).searchParams;
+     const repairId = Number(parameters.get("repairId") ?? 0);
+     const shop = parameters.get("shop")?.trim() ?? "";
++    const access = await authorizeApiRequest(request, repairId ? "repairs.view" : "orders.view");
++    if (access instanceof Response) return access;
+     const db = getDb();
+     if (repairId) {
++      const repair = (await db.select().from(repairs).where(eq(repairs.id, repairId)).limit(1))[0];
++      if (!repair) return Response.json({ error: "Réparation introuvable." }, { status: 404 });
++      const denied = authorizeShopAccess(access, repair.shop);
++      if (denied) return denied;
+       const parts = await db.select().from(repairParts).where(eq(repairParts.repairId, repairId)).orderBy(asc(repairParts.id));
+       return Response.json({ parts });
+     }
++    const denied = authorizeShopAccess(access, shop || "all");
++    if (denied) return denied;
+     const pending = await db.select({
+       id: repairParts.id, productId: repairParts.productId, shop: repairParts.shop, itemName: repairParts.itemName,
+       quality: repairParts.quality, quantity: repairParts.quantity, flow: repairParts.flow, status: repairParts.status,
+@@ -34,6 +43,8 @@
+ 
+ export async function POST(request: Request) {
+   try {
++    const access = await authorizeApiRequest(request, "repairs.edit");
++    if (access instanceof Response) return access;
+     const body = await request.json() as Record<string, unknown>;
+     const repairId = Number(body.repairId);
+     const productId = Number(body.productId);
+@@ -41,6 +52,10 @@
+     if (!Number.isInteger(repairId) || !Number.isInteger(productId) || !Number.isFinite(quantity) || quantity < 1) {
+       return Response.json({ error: "Pièce ou quantité invalide." }, { status: 400 });
+     }
++    const repair = (await getDb().select().from(repairs).where(eq(repairs.id, repairId)).limit(1))[0];
++    if (!repair) return Response.json({ error: "Réparation introuvable." }, { status: 404 });
++    const denied = authorizeShopAccess(access, repair.shop);
++    if (denied) return denied;
+     const part = await addPartToRepair({ repairId, productId, quantity, quality: String(body.quality ?? "") });
+     return Response.json({ part }, { status: 201 });
+   } catch (error) {
+@@ -50,11 +65,18 @@
+ 
+ export async function PATCH(request: Request) {
+   try {
++    const access = await authorizeApiRequest(request, ["repairs.edit", "orders.manage"]);
++    if (access instanceof Response) return access;
+     const body = await request.json() as Record<string, unknown>;
+     const ids = Array.isArray(body.ids) ? body.ids.map(Number).filter(Number.isInteger) : [];
+     const supplierStatuses = ["En attente", "Disponible", "Partiellement disponible", "Indisponible", "Alternative proposée"];
+     const orderStatuses = ["À commander", "Commandée", "Disponible fournisseur", "Partiellement reçue", "Reçue / Clôturée", "Annulée"];
+     if (ids.length) {
++      if (!access.permissions.includes("orders.manage")) return Response.json({ error: "Vous n’avez pas l’autorisation de gérer les commandes." }, { status: 403 });
++      const db = getDb();
++      const affected = await db.select({ shop: repairParts.shop }).from(repairParts).where(inArray(repairParts.id, ids));
++      if (affected.length !== ids.length) return Response.json({ error: "Une demande est introuvable." }, { status: 404 });
++      for (const item of affected) { const denied = authorizeShopAccess(access, item.shop); if (denied) return denied; }
+       const changes: { supplierStatus?: string; orderStatus?: string; updatedAt: ReturnType<typeof sql> } = { updatedAt: sql`CURRENT_TIMESTAMP` };
+       if (body.supplierStatus !== undefined) {
+         const value = String(body.supplierStatus); if (!supplierStatuses.includes(value)) return Response.json({ error: "État fournisseur invalide." }, { status: 400 }); changes.supplierStatus = value;
+@@ -72,6 +94,9 @@
+     const db = getDb();
+     const [part] = await db.select().from(repairParts).where(eq(repairParts.id, id)).limit(1);
+     if (!part) return Response.json({ error: "Pièce introuvable." }, { status: 404 });
++    if (!access.permissions.includes("repairs.edit")) return Response.json({ error: "Vous n’avez pas l’autorisation de modifier les pièces." }, { status: 403 });
++    const denied = authorizeShopAccess(access, part.shop);
++    if (denied) return denied;
+     if (status === "Non utilisée") return Response.json({ part: await markPartUnused(id) });
+     if (status === "Utilisée") {
+       if (!part.productId || !["Réservée", "Reçue"].includes(part.status)) return Response.json({ error: "La pièce doit être réservée ou reçue avant utilisation." }, { status: 409 });
+@@ -96,8 +121,14 @@
+ 
+ export async function DELETE(request: Request) {
+   try {
++    const access = await authorizeApiRequest(request, "repairs.edit");
++    if (access instanceof Response) return access;
+     const id = Number(new URL(request.url).searchParams.get("id") ?? 0);
+     if (!Number.isInteger(id)) return Response.json({ error: "Pièce invalide." }, { status: 400 });
++    const part = (await getDb().select().from(repairParts).where(eq(repairParts.id, id)).limit(1))[0];
++    if (!part) return Response.json({ error: "Pièce introuvable." }, { status: 404 });
++    const denied = authorizeShopAccess(access, part.shop);
++    if (denied) return denied;
+     return Response.json({ part: await markPartUnused(id) });
+   } catch (error) {
+     return Response.json({ error: error instanceof Error ? error.message : "Suppression impossible." }, { status: 500 });
+
+--- a/app/api/repairs/[id]/route.ts
++++ b/app/api/repairs/[id]/route.ts
+@@ -1,11 +1,14 @@
+ import { and, eq, sql } from "drizzle-orm";
+ import { getDb } from "../../../../db";
+ import { repairs } from "../../../../db/schema";
++import { authorizeApiRequest, authorizeShopAccess } from "../../../../lib/authz";
+ 
+ const allowedStatuses = ["En attente", "Diagnostic", "En réparation", "Pièce manquante", "Prêt", "Livré", "Non réparé"];
+ 
+ export async function PATCH(request: Request, context: { params: Promise<{ id: string }> }) {
+   try {
++    const access = await authorizeApiRequest(request, ["repairs.edit", "repairs.status"]);
++    if (access instanceof Response) return access;
+     const { id } = await context.params;
+     const repairId = Number(id);
+     const body = (await request.json()) as { status?: string; storageLocation?: string; shop?: string };
+@@ -16,9 +19,15 @@
+       return Response.json({ error: "Mise à jour invalide." }, { status: 400 });
+     }
+     const db = getDb();
++    const existing = (await db.select().from(repairs).where(eq(repairs.id, repairId)).limit(1))[0];
++    if (!existing) return Response.json({ error: "Réparation introuvable." }, { status: 404 });
++    const denied = authorizeShopAccess(access, existing.shop);
++    if (denied) return denied;
++    if (status && !access.permissions.includes("repairs.status")) return Response.json({ error: "Vous n’avez pas l’autorisation de changer le statut." }, { status: 403 });
++    if (storageLocation && !access.permissions.includes("repairs.edit")) return Response.json({ error: "Vous n’avez pas l’autorisation de modifier la fiche." }, { status: 403 });
+     const updated = await db.update(repairs)
+       .set({ ...(status ? { status } : {}), ...(storageLocation ? { storageLocation } : {}), updatedAt: sql`CURRENT_TIMESTAMP` })
+-      .where(and(eq(repairs.id, repairId), eq(repairs.shop, shop)))
++      .where(and(eq(repairs.id, repairId), eq(repairs.shop, existing.shop)))
+       .returning({ id: repairs.id, status: repairs.status, storageLocation: repairs.storageLocation });
+     if (!updated.length) return Response.json({ error: "Réparation introuvable." }, { status: 404 });
+     return Response.json({ repair: updated[0] });
+
+--- a/app/api/repairs/route.ts
++++ b/app/api/repairs/route.ts
+@@ -2,6 +2,7 @@
+ import { getDb } from "../../../db";
+ import { customers, repairParts, repairs } from "../../../db/schema";
+ import { addPartToRepair } from "../../../lib/repair-parts";
++import { authorizeApiRequest, authorizeShopAccess } from "../../../lib/authz";
+ 
+ function errorMessage(error: unknown) {
+   const message = error instanceof Error ? error.message : "Erreur inattendue";
+@@ -12,10 +13,14 @@
+ 
+ export async function GET(request: Request) {
+   try {
++    const access = await authorizeApiRequest(request, "repairs.view");
++    if (access instanceof Response) return access;
+     const db = getDb();
+     const parameters = new URL(request.url).searchParams;
+     const query = parameters.get("q")?.trim() ?? "";
+-    const shop = parameters.get("shop")?.trim() ?? "";
++    const shop = parameters.get("shop")?.trim() || "all";
++    const denied = authorizeShopAccess(access, shop);
++    if (denied) return denied;
+     const searchWhere = query
+       ? or(
+           like(customers.name, `%${query}%`),
+@@ -24,7 +29,7 @@
+           like(repairs.model, `%${query}%`)
+         )
+       : undefined;
+-    const shopWhere = shop && shop !== "all" ? eq(repairs.shop, shop) : undefined;
++    const shopWhere = shop !== "all" ? eq(repairs.shop, shop) : undefined;
+     const where = searchWhere && shopWhere ? and(shopWhere, searchWhere) : shopWhere ?? searchWhere;
+ 
+     const rows = await db
+@@ -63,6 +68,8 @@
+ 
+ export async function POST(request: Request) {
+   try {
++    const access = await authorizeApiRequest(request, "repairs.create");
++    if (access instanceof Response) return access;
+     const body = (await request.json()) as Record<string, unknown>;
+     const name = String(body.customerName ?? "").trim();
+     const phone = String(body.customerPhone ?? "").trim();
+@@ -73,6 +80,8 @@
+     const partQuality = String(body.partQuality ?? "").trim();
+     const issue = String(body.issue ?? "").trim();
+     const shop = String(body.shop ?? "").trim();
++    const denied = authorizeShopAccess(access, shop);
++    if (denied) return denied;
+     const price = Number(body.price ?? 0);
+     const deposit = Number(body.deposit ?? 0);
+     const usedParts = Array.isArray(body.usedParts) ? body.usedParts.map((part) => part as Record<string, unknown>).map((part) => {
+
+--- a/app/api/sales/route.ts
++++ b/app/api/sales/route.ts
+@@ -1,12 +1,15 @@
+ import { and, desc, eq, inArray, like, or } from "drizzle-orm";
+ import { getDb } from "../../../db";
+ import { cashboxes, cashMovements, products, saleLines, sales, stockMovements } from "../../../db/schema";
++import { authorizeApiRequest, authorizeShopAccess } from "../../../lib/authz";
+ 
+ type LineInput = { productId: number; quantity: number; unitPrice: number };
+ const validShops = ["ProPhone", "MidouGSM"];
+ 
+ export async function GET(request: Request) {
+   try {
++    const access = await authorizeApiRequest(request, "sales.view");
++    if (access instanceof Response) return access;
+     const parameters = new URL(request.url).searchParams;
+     const id = Number(parameters.get("id") ?? 0);
+     const shop = parameters.get("shop") ?? "all";
+@@ -15,9 +18,13 @@
+     if (id) {
+       const sale = (await db.select().from(sales).where(eq(sales.id, id)).limit(1))[0];
+       if (!sale) return Response.json({ error: "Bon de vente introuvable." }, { status: 404 });
++      const denied = authorizeShopAccess(access, sale.shop);
++      if (denied) return denied;
+       const lines = await db.select().from(saleLines).where(eq(saleLines.saleId, id));
+       return Response.json({ sale, lines }, { headers: { "Cache-Control": "no-store" } });
+     }
++    const denied = authorizeShopAccess(access, shop);
++    if (denied) return denied;
+     const clauses = [shop !== "all" ? eq(sales.shop, shop) : undefined, query ? or(like(sales.receiptNumber, `%${query}%`), like(sales.customerName, `%${query}%`)) : undefined].filter(Boolean);
+     const where = clauses.length === 2 ? and(clauses[0], clauses[1]) : clauses[0];
+     const rows = await db.select().from(sales).where(where).orderBy(desc(sales.id)).limit(150);
+@@ -30,6 +37,8 @@
+ 
+ export async function POST(request: Request) {
+   try {
++    const access = await authorizeApiRequest(request, "sales.use");
++    if (access instanceof Response) return access;
+     const body = await request.json() as Record<string, unknown>;
+     const shop = String(body.shop ?? "");
+     const customerName = String(body.customerName ?? "VENTE-COMPTOIR").trim() || "VENTE-COMPTOIR";
+@@ -37,6 +46,9 @@
+     const discountAmount = Math.max(0, Math.round(Number(body.discountAmount ?? 0)));
+     const requestedPaidAmount = Math.max(0, Math.round(Number(body.paidAmount ?? 0)));
+     const cashboxId = body.cashboxId ? Number(body.cashboxId) : null;
++    const denied = authorizeShopAccess(access, shop);
++    if (denied) return denied;
++    if (discountAmount > 0 && !access.permissions.includes("sales.discount")) return Response.json({ error: "Vous n’avez pas l’autorisation d’accorder une remise." }, { status: 403 });
+     if (!validShops.includes(shop) || !lines.length || lines.some((line) => !Number.isInteger(line.productId) || line.quantity <= 0 || line.unitPrice <= 0)) {
+       return Response.json({ error: "Bon de vente invalide." }, { status: 400 });
+     }
+
+--- a/app/api/settings/route.ts
++++ b/app/api/settings/route.ts
+@@ -1,15 +1,18 @@
+-import { eq, sql } from "drizzle-orm";
++import { eq, inArray, sql } from "drizzle-orm";
+ import { getDb } from "../../../db";
+ import { shopSettings } from "../../../db/schema";
++import { authorizeApiRequest, authorizeShopAccess } from "../../../lib/authz";
+ 
+ const shops = ["ProPhone", "MidouGSM"];
+ 
+-export async function GET() {
++export async function GET(request: Request) {
+   try {
++    const access = await authorizeApiRequest(request);
++    if (access instanceof Response) return access;
+     const db = getDb();
+     const existing = await db.select().from(shopSettings);
+-    for (const shop of shops) if (!existing.some((row) => row.shop === shop)) await db.insert(shopSettings).values({ shop }).onConflictDoNothing();
+-    return Response.json({ settings: await db.select().from(shopSettings) });
++    for (const shop of access.shops) if (shops.includes(shop) && !existing.some((row) => row.shop === shop)) await db.insert(shopSettings).values({ shop }).onConflictDoNothing();
++    return Response.json({ settings: await db.select().from(shopSettings).where(inArray(shopSettings.shop, access.shops)) });
+   } catch (error) {
+     return Response.json({ error: error instanceof Error ? error.message : "Paramètres indisponibles." }, { status: 500 });
+   }
+@@ -17,9 +20,13 @@
+ 
+ export async function PATCH(request: Request) {
+   try {
++    const access = await authorizeApiRequest(request, "settings.manage");
++    if (access instanceof Response) return access;
+     const body = await request.json() as Record<string, unknown>;
+     const shop = String(body.shop ?? "");
+     if (!shops.includes(shop)) return Response.json({ error: "Magasin invalide." }, { status: 400 });
++    const denied = authorizeShopAccess(access, shop);
++    if (denied) return denied;
+     const values = {
+       negativeStockPolicy: String(body.negativeStockPolicy ?? "manager_reason"),
+       reserveRepairParts: Boolean(body.reserveRepairParts),
+
+--- a/app/api/suppliers/[id]/route.ts
++++ b/app/api/suppliers/[id]/route.ts
+@@ -1,16 +1,22 @@
+ import { and, eq, ne } from "drizzle-orm";
+ import { getDb } from "../../../../db";
+ import { cashboxes, cashMovements, supplierPayments, suppliers } from "../../../../db/schema";
++import { authorizeApiRequest, authorizeShopAccess } from "../../../../lib/authz";
+ 
+ const shops = ["ProPhone", "MidouGSM"]; const supplierTypes = ["Accessoires", "Pièces détachées", "Mixte"]; const origins = ["Algérien", "Chinois", "Autre"];
+ export async function PATCH(request: Request, context: { params: Promise<{ id: string }> }) {
+   try {
++    const access = await authorizeApiRequest(request, "suppliers.manage");
++    if (access instanceof Response) return access;
+     const id = Number((await context.params).id); const body = await request.json() as Record<string, unknown>;
+     const db = getDb();
+     if (body.action === "payment") {
+       const amount = Math.round(Number(body.amount ?? 0)); const cashboxId = body.cashboxId ? Number(body.cashboxId) : null;
+       if (!Number.isFinite(amount) || amount <= 0) return Response.json({ error: "Montant invalide." }, { status: 400 });
+       const supplier = (await db.select().from(suppliers).where(eq(suppliers.id, id)).limit(1))[0]; if (!supplier) return Response.json({ error: "Fournisseur introuvable." }, { status: 404 });
++      const denied = authorizeShopAccess(access, supplier.shop);
++      if (denied) return denied;
++      if (cashboxId && !access.permissions.includes("cash.manage")) return Response.json({ error: "Vous n’avez pas l’autorisation d’enregistrer un mouvement de caisse." }, { status: 403 });
+       let cashbox = null; if (cashboxId) { cashbox = (await db.select().from(cashboxes).where(eq(cashboxes.id, cashboxId)).limit(1))[0]; if (!cashbox || cashbox.shop !== supplier.shop) return Response.json({ error: "Caisse invalide pour ce magasin." }, { status: 400 }); }
+       const created = (await db.insert(supplierPayments).values({ supplierId: id, shop: supplier.shop, amount, cashboxId, method: String(body.method ?? "Espèces"), notes: String(body.notes ?? "").trim() }).returning())[0];
+       if (cashbox) await db.insert(cashMovements).values({ cashboxId: cashbox.id, shop: supplier.shop, direction: "out", movementType: "Versement fournisseur", amount, reason: `Versement fournisseur · ${supplier.name}`, reference: `FOU-${supplier.id}-${created.id}` });
+@@ -18,13 +24,19 @@
+     }
+     const name = String(body.name ?? "").trim(); const shop = String(body.shop ?? ""); const supplierType = String(body.supplierType ?? "Accessoires"); const origin = String(body.origin ?? "Algérien");
+     if (!Number.isInteger(id) || !name || !shops.includes(shop) || !supplierTypes.includes(supplierType) || !origins.includes(origin)) return Response.json({ error: "Informations fournisseur invalides." }, { status: 400 });
++    const existing = (await db.select().from(suppliers).where(eq(suppliers.id, id)).limit(1))[0];
++    if (!existing) return Response.json({ error: "Fournisseur introuvable." }, { status: 404 });
++    const existingDenied = authorizeShopAccess(access, existing.shop);
++    if (existingDenied) return existingDenied;
++    const targetDenied = authorizeShopAccess(access, shop);
++    if (targetDenied) return targetDenied;
+     const duplicate = await db.select({ id: suppliers.id }).from(suppliers).where(and(eq(suppliers.shop, shop), eq(suppliers.name, name), ne(suppliers.id, id))).limit(1);
+     if (duplicate.length) return Response.json({ error: "Ce fournisseur existe déjà dans ce magasin." }, { status: 409 });
+     const updated = (await db.update(suppliers).set({ name, shop, supplierType, origin, phone: String(body.phone ?? "").trim(), email: String(body.email ?? "").trim(), city: String(body.city ?? "").trim(), currency: String(body.currency ?? "DZD"), notes: String(body.notes ?? "").trim(), updatedAt: new Date().toISOString() }).where(eq(suppliers.id, id)).returning())[0];
+     if (!updated) return Response.json({ error: "Fournisseur introuvable." }, { status: 404 }); return Response.json({ supplier: updated });
+   } catch (error) { return Response.json({ error: error instanceof Error ? error.message : "Modification impossible." }, { status: 500 }); }
+ }
+-export async function DELETE(_: Request, context: { params: Promise<{ id: string }> }) {
+-  try { const id = Number((await context.params).id); const db = getDb(); await db.delete(supplierPayments).where(eq(supplierPayments.supplierId, id)); const deleted = await db.delete(suppliers).where(eq(suppliers.id, id)).returning({ id: suppliers.id }); if (!deleted.length) return Response.json({ error: "Fournisseur introuvable." }, { status: 404 }); return Response.json({ ok: true }); }
++export async function DELETE(request: Request, context: { params: Promise<{ id: string }> }) {
++  try { const access = await authorizeApiRequest(request, "suppliers.manage"); if (access instanceof Response) return access; const id = Number((await context.params).id); const db = getDb(); const existing = (await db.select().from(suppliers).where(eq(suppliers.id, id)).limit(1))[0]; if (!existing) return Response.json({ error: "Fournisseur introuvable." }, { status: 404 }); const denied = authorizeShopAccess(access, existing.shop); if (denied) return denied; await db.delete(supplierPayments).where(eq(supplierPayments.supplierId, id)); const deleted = await db.delete(suppliers).where(eq(suppliers.id, id)).returning({ id: suppliers.id }); if (!deleted.length) return Response.json({ error: "Fournisseur introuvable." }, { status: 404 }); return Response.json({ ok: true }); }
+   catch (error) { return Response.json({ error: error instanceof Error ? error.message : "Suppression impossible." }, { status: 500 }); }
+ }
+
+--- a/app/api/suppliers/route.ts
++++ b/app/api/suppliers/route.ts
+@@ -1,6 +1,7 @@
+ import { and, asc, eq, like, or, sql } from "drizzle-orm";
+ import { getDb } from "../../../db";
+ import { purchases, supplierPayments, suppliers } from "../../../db/schema";
++import { authorizeApiRequest, authorizeShopAccess } from "../../../lib/authz";
+ 
+ const shops = ["ProPhone", "MidouGSM"];
+ const supplierTypes = ["Accessoires", "Pièces détachées", "Mixte"];
+@@ -8,7 +9,11 @@
+ 
+ export async function GET(request: Request) {
+   try {
+-    const params = new URL(request.url).searchParams; const shop = params.get("shop") ?? "all"; const query = params.get("q")?.trim() ?? "";
++    const access = await authorizeApiRequest(request, "suppliers.manage");
++    if (access instanceof Response) return access;
++    const params = new URL(request.url).searchParams; const shop = params.get("shop") || "all"; const query = params.get("q")?.trim() ?? "";
++    const denied = authorizeShopAccess(access, shop);
++    if (denied) return denied;
+     const type = params.get("type") ?? "all"; const origin = params.get("origin") ?? "all"; const balance = params.get("balance") ?? "all";
+     const db = getDb();
+     const clauses = [shop !== "all" ? eq(suppliers.shop, shop) : undefined, type !== "all" ? eq(suppliers.supplierType, type) : undefined, origin !== "all" ? eq(suppliers.origin, origin) : undefined, query ? or(like(suppliers.name, `%${query}%`), like(suppliers.phone, `%${query}%`), like(suppliers.city, `%${query}%`)) : undefined].filter(Boolean);
+@@ -26,8 +31,12 @@
+ 
+ export async function POST(request: Request) {
+   try {
++    const access = await authorizeApiRequest(request, "suppliers.manage");
++    if (access instanceof Response) return access;
+     const body = await request.json() as Record<string, unknown>; const name = String(body.name ?? "").trim(); const shop = String(body.shop ?? ""); const supplierType = String(body.supplierType ?? "Accessoires"); const origin = String(body.origin ?? "Algérien");
+     if (!name || !shops.includes(shop) || !supplierTypes.includes(supplierType) || !origins.includes(origin)) return Response.json({ error: "Informations fournisseur invalides." }, { status: 400 });
++    const denied = authorizeShopAccess(access, shop);
++    if (denied) return denied;
+     const db = getDb(); const existing = await db.select({ id: suppliers.id }).from(suppliers).where(and(eq(suppliers.shop, shop), eq(suppliers.name, name))).limit(1);
+     if (existing.length) return Response.json({ error: "Ce fournisseur existe déjà dans ce magasin." }, { status: 409 });
+     const created = (await db.insert(suppliers).values({ name, shop, supplierType, origin, phone: String(body.phone ?? "").trim(), email: String(body.email ?? "").trim(), city: String(body.city ?? "").trim(), currency: String(body.currency ?? (origin === "Chinois" ? "USD" : "DZD")), notes: String(body.notes ?? "").trim() }).returning())[0];
+
+--- a/app/cash-view.tsx
++++ b/app/cash-view.tsx
+@@ -32,13 +32,13 @@
+   const loadCash = useCallback(async () => {
+     setLoading(true);
+     try {
+-      const response = await fetch("/api/cash?shop=all");
++      const response = await fetch(`/api/cash?shop=${encodeURIComponent(activeShop)}`);
+       const data = await response.json() as { cashboxes: Cashbox[]; movements: Movement[]; error?: string };
+       if (!response.ok) throw new Error(data.error);
+       setCashboxes(data.cashboxes); setMovements(data.movements);
+     } catch (error) { toast.error(error instanceof Error ? error.message : "Caisses indisponibles."); }
+     finally { setLoading(false); }
+-  }, []);
++  }, [activeShop]);
+ 
+   useEffect(() => { void loadCash(); }, [loadCash]);
+ 
+
+--- a/app/page.tsx
++++ b/app/page.tsx
+@@ -480,7 +480,7 @@
+           : activeView === "suppliers" ? <SupplierView activeShop={activeShop}/>
+           : activeView === "users" ? <UsersView/>
+           : activeView === "settings" ? <SettingsView activeShop={activeShop} onOpenUsers={() => setActiveView("users")} onOpenCash={() => setActiveView("cash")}/>
+-          : <StockView activeShop={activeShop} onOpenPurchases={() => setActiveView("purchases")} onOpenSales={() => setActiveView("sales")}/>}
++          : <StockView activeShop={activeShop} canViewPurchasePrice={can("stock.purchase_price")} onOpenPurchases={() => setActiveView("purchases")} onOpenSales={() => setActiveView("sales")}/>}
+       </main>
+ 
+       <Dialog open={open} onOpenChange={(nextOpen) => { setOpen(nextOpen); if (!nextOpen) resetDeviceFields(); }}>
+
+--- a/app/stock-view.tsx
++++ b/app/stock-view.tsx
+@@ -10,7 +10,7 @@
+ import { Textarea } from "@/components/ui/textarea";
+ 
+ type ActiveShop = "all" | "ProPhone" | "MidouGSM";
+-type Product = { id: number; sku: string; barcode: string; name: string; family: string; subfamily: string; brand: string; model: string; quality: string; manufacturer: string; color: string; sourceReference: string; purchasePrice: number; pv1: number; pv2: number; pv3: number; warranty: string; notes: string; stock: { ProPhone: number; MidouGSM: number } };
++type Product = { id: number; sku: string; barcode: string; name: string; family: string; subfamily: string; brand: string; model: string; quality: string; manufacturer: string; color: string; sourceReference: string; purchasePrice?: number; pv1: number; pv2: number; pv3: number; warranty: string; notes: string; stock: { ProPhone: number; MidouGSM: number } };
+ type TaxonomyCategory = "family" | "subfamily" | "brand" | "model" | "quality" | "manufacturer" | "color";
+ type TaxonomyEntry = { name: string; abbreviation: string; parent?: string };
+ type Taxonomy = Record<TaxonomyCategory, TaxonomyEntry[]>;
+@@ -90,7 +90,7 @@
+   </div>;
+ }
+ 
+-export function StockView({ activeShop, onOpenPurchases, onOpenSales }: { activeShop: ActiveShop; onOpenPurchases: () => void; onOpenSales: () => void }) {
++export function StockView({ activeShop, canViewPurchasePrice, onOpenPurchases, onOpenSales }: { activeShop: ActiveShop; canViewPurchasePrice: boolean; onOpenPurchases: () => void; onOpenSales: () => void }) {
+   const [products, setProducts] = useState<Product[]>([]);
+   const [taxonomy, setTaxonomy] = useState<Taxonomy>(emptyTaxonomy);
+   const [query, setQuery] = useState("");
+@@ -194,14 +194,14 @@
+     <div className="page-heading"><div><span className="eyebrow">CATALOGUE PARTAGÉ · STOCKS SÉPARÉS</span><h2>Stock & produits</h2><p>Identité complète, fabricant et quatre niveaux de prix. Le stock reste séparé entre les deux magasins.</p></div><div className="heading-actions"><Button variant="outline" onClick={onOpenPurchases}><ShoppingCart size={17}/> Bon d’achat</Button><Button variant="outline" onClick={onOpenSales}><ShoppingBag size={17}/> Bon de vente</Button><Button variant="outline" onClick={() => setImportOpen(true)}><Upload size={17}/> Importer fichier</Button><Button className="primary-action" onClick={() => { resetForm(); setOpen(true); }}><PackagePlus size={18}/> Nouveau produit</Button></div></div>
+     <div className="metrics stock-metrics"><article><span className="metric-icon blue"><Tag/></span><div><small>Produits référencés</small><strong>{products.length}</strong></div></article><article><span className="metric-icon green"><Boxes/></span><div><small>Unités en stock</small><strong>{totalUnits}</strong></div></article><article><span className="metric-icon orange"><Barcode/></span><div><small>Références disponibles</small><strong>{stockedReferences}</strong></div></article></div>
+     <div className="stock-rule"><ShieldCheck size={20}/><div><b>Chaque nouveau produit démarre avec une quantité de 0 dans ProPhone et MidouGSM</b><span>Les quantités seront saisies lors du stock initial ou d’un bon d’achat. PA, PV1, PV2 et PV3 restent modifiables sur la fiche.</span></div></div>
+-    <section className="panel"><div className="panel-toolbar"><div><h3>Catalogue produits</h3><p>SKU et code-barres automatiques · recherche aussi par référence et fabricant.</p></div><div className="search-box"><Search size={18}/><Input value={query} onChange={(event) => setQuery(event.target.value)} placeholder="Produit, référence, fabricant, marque…"/></div></div><div className="table-wrap"><table className="stock-table"><thead><tr><th>Produit</th><th>Classification</th><th>Marque / modèle</th><th>Qualité / fabricant</th><th>PA / prix de vente</th><th>Stock</th><th></th></tr></thead><tbody>{loading ? <tr><td colSpan={7} className="empty-row">Chargement…</td></tr> : products.length ? products.map((product) => <tr key={product.id}><td><b className="generated-product-name">{product.name}</b><small>{product.sourceReference || product.barcode}</small></td><td><b>{product.family}</b><small>{product.subfamily || "Sans sous-famille"}</small></td><td><b>{product.brand || "—"}</b><small>{product.model || "Tous modèles"}</small></td><td><b>{product.quality || "Standard"}</b><small>{product.manufacturer || "Fabricant non défini"}{product.color ? ` · ${product.color}` : ""}</small></td><td><b>PA {product.purchasePrice.toLocaleString("fr-DZ")} DA</b><small>PV1 {product.pv1.toLocaleString("fr-DZ")} · PV2 {product.pv2.toLocaleString("fr-DZ")} · PV3 {product.pv3.toLocaleString("fr-DZ")}</small></td><td>{activeShop === "all" ? <div className="dual-stock"><span className="prophone">P <b>{product.stock.ProPhone}</b></span><span className="midou">M <b>{product.stock.MidouGSM}</b></span></div> : <strong>{product.stock[activeShop]}</strong>}</td><td><Button variant="outline" size="sm" aria-label={`Modifier ${product.name}`} onClick={() => editProduct(product)}><Pencil size={15}/></Button></td></tr>) : <tr><td colSpan={7} className="empty-row"><PackagePlus size={34}/><b>Aucun produit</b><span>Créez les fiches produits avec une nomenclature uniforme.</span><Button onClick={() => { resetForm(); setOpen(true); }}>Nouveau produit</Button></td></tr>}</tbody></table></div></section>
++    <section className="panel"><div className="panel-toolbar"><div><h3>Catalogue produits</h3><p>SKU et code-barres automatiques · recherche aussi par référence et fabricant.</p></div><div className="search-box"><Search size={18}/><Input value={query} onChange={(event) => setQuery(event.target.value)} placeholder="Produit, référence, fabricant, marque…"/></div></div><div className="table-wrap"><table className="stock-table"><thead><tr><th>Produit</th><th>Classification</th><th>Marque / modèle</th><th>Qualité / fabricant</th><th>{canViewPurchasePrice ? "PA / prix de vente" : "Prix de vente"}</th><th>Stock</th><th></th></tr></thead><tbody>{loading ? <tr><td colSpan={7} className="empty-row">Chargement…</td></tr> : products.length ? products.map((product) => <tr key={product.id}><td><b className="generated-product-name">{product.name}</b><small>{product.sourceReference || product.barcode}</small></td><td><b>{product.family}</b><small>{product.subfamily || "Sans sous-famille"}</small></td><td><b>{product.brand || "—"}</b><small>{product.model || "Tous modèles"}</small></td><td><b>{product.quality || "Standard"}</b><small>{product.manufacturer || "Fabricant non défini"}{product.color ? ` · ${product.color}` : ""}</small></td><td>{canViewPurchasePrice && <b>PA {(product.purchasePrice ?? 0).toLocaleString("fr-DZ")} DA</b>}<small>PV1 {product.pv1.toLocaleString("fr-DZ")} · PV2 {product.pv2.toLocaleString("fr-DZ")} · PV3 {product.pv3.toLocaleString("fr-DZ")}</small></td><td>{activeShop === "all" ? <div className="dual-stock"><span className="prophone">P <b>{product.stock.ProPhone}</b></span><span className="midou">M <b>{product.stock.MidouGSM}</b></span></div> : <strong>{product.stock[activeShop]}</strong>}</td><td><Button variant="outline" size="sm" aria-label={`Modifier ${product.name}`} onClick={() => editProduct(product)}><Pencil size={15}/></Button></td></tr>) : <tr><td colSpan={7} className="empty-row"><PackagePlus size={34}/><b>Aucun produit</b><span>Créez les fiches produits avec une nomenclature uniforme.</span><Button onClick={() => { resetForm(); setOpen(true); }}>Nouveau produit</Button></td></tr>}</tbody></table></div></section>
+ 
+     <Dialog open={open} onOpenChange={(next) => { setOpen(next); if (!next) resetForm(); }}><DialogContent className="product-dialog sm:max-w-[960px]"><DialogHeader><DialogTitle>{editingProduct ? "Modifier le produit" : "Nouveau produit"}</DialogTitle><DialogDescription>Identité normalisée, fabricant et prix. La quantité initiale reste à 0 jusqu’au premier inventaire ou achat.</DialogDescription></DialogHeader><form key={editingProduct?.id ?? "new"} onSubmit={createProduct} className="product-form">
+       <div className="product-name-preview"><div><small>NOM PRODUIT GÉNÉRÉ</small><strong>{generatedName || "AF IPH 11 PM APP ORG BLK"}</strong></div><span><Barcode size={18}/> SKU + Barcode automatiques</span></div>
+       <fieldset><legend>Classification liée</legend><div className="form-grid two"><TaxonomyField category="family" label="Famille" value={family.name} abbreviation={family.abbreviation} entries={taxonomy.family} required placeholder="Choisir ou écrire…" onSelect={(name, abbreviation) => { setFamily({ name, abbreviation }); setSubfamily({ name: "", abbreviation: "" }); }} onSaved={loadTaxonomy}/><TaxonomyField category="subfamily" label="Sous-famille" value={subfamily.name} abbreviation={subfamily.abbreviation} entries={taxonomy.subfamily} parent={family.name} required placeholder={family.name ? "Choisir selon la famille…" : "Choisir la famille d’abord"} onSelect={(name, abbreviation) => { setSubfamily({ name, abbreviation }); setQuality({ name: "", abbreviation: "" }); }} onSaved={loadTaxonomy}/></div></fieldset>
+       <fieldset><legend>Appareil</legend><div className="form-grid two"><TaxonomyField category="brand" label="Marque" value={brand.name} abbreviation={brand.abbreviation} entries={taxonomy.brand} required placeholder="Samsung, Apple…" onSelect={(name, abbreviation) => { setBrand({ name, abbreviation }); setModel({ name: "", abbreviation: "" }); }} onSaved={loadTaxonomy}/><TaxonomyField category="model" label="Modèle" value={model.name} abbreviation={model.abbreviation} entries={taxonomy.model} parent={brand.name} required placeholder={brand.name ? "A14, iPhone 11 Pro Max…" : "Choisir la marque d’abord"} onSelect={(name, abbreviation) => setModel({ name, abbreviation })} onSaved={loadTaxonomy}/></div></fieldset>
+       <fieldset><legend>Caractéristiques</legend><div className="form-grid three"><TaxonomyField category="quality" label="Type / qualité" value={quality.name} abbreviation={quality.abbreviation} entries={taxonomy.quality} parent={subfamily.name} required placeholder="Original, OLED, INCELL…" onSelect={(name, abbreviation) => setQuality({ name, abbreviation })} onSaved={loadTaxonomy}/><TaxonomyField category="manufacturer" label="Fabricant" value={manufacturer.name} abbreviation={manufacturer.abbreviation} entries={taxonomy.manufacturer} placeholder="GX, Bosonni, ACE…" onSelect={(name, abbreviation) => setManufacturer({ name, abbreviation })} onSaved={loadTaxonomy}/><TaxonomyField category="color" label="Couleur" value={color.name} abbreviation={color.abbreviation} entries={taxonomy.color} placeholder="Black, White, Blue…" onSelect={(name, abbreviation) => setColor({ name, abbreviation })} onSaved={loadTaxonomy}/></div><div className="form-grid three product-row"><div><Label>Référence PME / fournisseur</Label><Input name="sourceReference" defaultValue={editingProduct?.sourceReference} placeholder="Référence d’origine…"/></div><div><Label>Garantie</Label><Input name="warranty" defaultValue={editingProduct?.warranty} placeholder="30 jours…"/></div><div><Label>Notes</Label><Textarea name="notes" defaultValue={editingProduct?.notes} placeholder="Détails techniques…"/></div></div></fieldset>
+-      <fieldset><legend>Prix</legend><div className="form-grid four product-prices"><div><Label>PA · Prix d’achat</Label><Input name="purchasePrice" type="number" min="0" step="1" defaultValue={editingProduct?.purchasePrice ?? 0}/></div><div><Label>PV1 · Détail</Label><Input name="pv1" type="number" min="0" step="1" defaultValue={editingProduct?.pv1 ?? 0}/></div><div><Label>PV2</Label><Input name="pv2" type="number" min="0" step="1" defaultValue={editingProduct?.pv2 ?? 0}/></div><div><Label>PV3</Label><Input name="pv3" type="number" min="0" step="1" defaultValue={editingProduct?.pv3 ?? 0}/></div></div><small className="price-hint">Montants en DA · les quatre prix pourront être corrigés à tout moment.</small></fieldset>
++      <fieldset><legend>Prix</legend><div className="form-grid four product-prices">{canViewPurchasePrice && <div><Label>PA · Prix d’achat</Label><Input name="purchasePrice" type="number" min="0" step="1" defaultValue={editingProduct?.purchasePrice ?? 0}/></div>}<div><Label>PV1 · Détail</Label><Input name="pv1" type="number" min="0" step="1" defaultValue={editingProduct?.pv1 ?? 0}/></div><div><Label>PV2</Label><Input name="pv2" type="number" min="0" step="1" defaultValue={editingProduct?.pv2 ?? 0}/></div><div><Label>PV3</Label><Input name="pv3" type="number" min="0" step="1" defaultValue={editingProduct?.pv3 ?? 0}/></div></div><small className="price-hint">Montants en DA · les prix pourront être corrigés à tout moment.</small></fieldset>
+       <input type="hidden" name="name" value={generatedName}/><div className="dialog-buttons"><Button type="button" variant="outline" onClick={() => setOpen(false)}>Annuler</Button><Button className="primary-action" disabled={saving || !generatedName}>{saving ? "Enregistrement…" : editingProduct ? "Enregistrer les modifications" : "Créer le produit"}</Button></div>
+     </form></DialogContent></Dialog>
+     <Dialog open={importOpen} onOpenChange={(next) => { setImportOpen(next); if (!next) { setImportRows([]); setImportName(""); } }}><DialogContent className="product-import-dialog sm:max-w-[940px]"><DialogHeader><DialogTitle>Importer des produits</DialogTitle><DialogDescription>CSV compatible Excel · aperçu avant enregistrement · les doublons sont ignorés.</DialogDescription></DialogHeader>
+
+--- a/lib/authz.ts
++++ b/lib/authz.ts
+@@ -40,9 +40,32 @@
+   return user;
+ }
+ 
++/** Authenticate an API request without performing first-user bootstrap. */
++export async function authorizeApiRequest(request: Request, permission?: string | string[]) {
++  try {
++    const user = await getCurrentUser(request);
++    const required = permission === undefined ? [] : Array.isArray(permission) ? permission : [permission];
++    if (required.length && !required.some((code) => user.permissions.includes(code))) {
++      return Response.json({ error: "Vous n’avez pas cette autorisation." }, { status: 403 });
++    }
++    return user;
++  } catch (error) {
++    return authErrorResponse(error, "Authentification requise.");
++  }
++}
++
+ export function assertShop(user: CurrentUser, shop: string) {
+   if (shop !== "all" && !user.shops.includes(shop)) throw new AuthError("Ce magasin n’est pas autorisé.", 403);
+   if (shop === "all" && !user.permissions.includes("global.view")) throw new AuthError("La vue globale n’est pas autorisée.", 403);
++}
++
++export function authorizeShopAccess(user: CurrentUser, shop: string) {
++  try {
++    assertShop(user, shop);
++    return null;
++  } catch (error) {
++    return authErrorResponse(error, "Accès au magasin refusé.");
++  }
+ }
+ 
+ export async function audit(user: CurrentUser, input: { shop?: string; action: string; entityType: string; entityId?: string | number; details?: unknown }) {
+
